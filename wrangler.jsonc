@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cpos-hyperdrive-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "4d1fbf388ce747e18afcc98c39604127"
+    }
+  ],
+  "vars": {
+    "SUPABASE_ORIGIN_URL": "https://jfgyjjuroizqgajoeyey.supabase.co"
+  }
+}
