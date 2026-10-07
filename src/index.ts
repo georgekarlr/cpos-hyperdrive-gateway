@@ -70,15 +70,16 @@ function createDbClient(connectionString: string) {
 // -----------------------------------------------------------------------------
 // 2. 1-STEP R2 UPLOAD + AUTOMATIC DATABASE SAVE (/api/upload)
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// 2. 1-STEP R2 UPLOAD + AUTO-SAVE + AUTO-CLEANUP PREVIOUS FILES (/api/upload)
+// -----------------------------------------------------------------------------
 app.post('/api/upload', async (c) => {
   try {
-    // A. Verify R2 Bucket Binding
     if (!c.env.R2_BUCKET) {
-      console.error('[Upload Error]: R2_BUCKET binding is missing from wrangler configuration.');
       return c.json({ message: 'Server configuration error: R2 bucket not bound.', code: '500' }, 500);
     }
 
-    // B. Authenticate via Supabase JWT
+    // 1. Authenticate via Supabase JWT
     const authHeader = c.req.header('authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return c.json({ message: 'Unauthorized: User session required.', code: '401' }, 401);
@@ -95,7 +96,7 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'Invalid token or session expired.', details: err.message, code: '401' }, 401);
     }
 
-    // C. Parse Multipart Form Data
+    // 2. Parse Multipart Form Data
     let formData: FormData;
     try {
       formData = await c.req.formData();
@@ -117,7 +118,6 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'No file provided in request.', code: '400' }, 400);
     }
 
-    // D. Validation: Size limit (max 15MB) & Allowed mime types
     if (file.size > 15 * 1024 * 1024) {
       return c.json({ message: 'File exceeds 15MB size limit.', code: '400' }, 400);
     }
@@ -127,10 +127,22 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'Only PDF, PNG, JPG, and WEBP files are allowed.', code: '400' }, 400);
     }
 
-    // E. Save to Cloudflare R2 ('ceintelly' bucket)
+    // 3. Generate Clean File Key
     const extension = file.name.split('.').pop() || 'bin';
-    const fileKey = `${docType}/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
+    let fileKey: string;
+    let cleanupPrefix: string | null = null;
 
+    if (docType === '2303' || docType === '2307') {
+      fileKey = `${docType}/${userId}/${Date.now()}.${extension}`;
+      cleanupPrefix = `${docType}/${userId}/`; // Will delete any old 2303/2307 for this user
+    } else if (productId && (docType === 'product_image' || docType === 'products')) {
+      fileKey = `products/${userId}/prod-${productId}-${Date.now()}.${extension}`;
+      cleanupPrefix = `products/${userId}/prod-${productId}-`; // Will delete old image for this product
+    } else {
+      fileKey = `${docType}/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
+    }
+
+    // 4. Save New File to R2
     const arrayBuffer = await file.arrayBuffer();
     await c.env.R2_BUCKET.put(fileKey, arrayBuffer, {
       httpMetadata: { contentType: file.type },
@@ -141,10 +153,25 @@ app.post('/api/upload', async (c) => {
       },
     });
 
+    // 5. AUTOMATIC CLEANUP: Delete previous file from R2 so files don't stack!
+    if (cleanupPrefix) {
+      try {
+        const existingObjects = await c.env.R2_BUCKET.list({ prefix: cleanupPrefix });
+        for (const obj of existingObjects.objects) {
+          // If it's not the file we just uploaded, delete it permanently!
+          if (obj.key !== fileKey) {
+            await c.env.R2_BUCKET.delete(obj.key);
+          }
+        }
+      } catch (cleanupErr) {
+        console.warn('[R2 Auto-Cleanup Warning]:', cleanupErr);
+      }
+    }
+
     const workerUrl = new URL(c.req.url).origin;
     const publicUrl = `${workerUrl}/files/${fileKey}`;
 
-    // F. AUTOMATIC DATABASE SAVE VIA HYPERDRIVE
+    // 6. AUTOMATIC DATABASE SAVE VIA HYPERDRIVE
     const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
     let savedEntity = 'none';
 
@@ -180,7 +207,7 @@ app.post('/api/upload', async (c) => {
         savedEntity = 'product_image';
       }
 
-      // Bump tenant cache version automatically
+      // Bump cache version automatically
       const scope = docType.includes('230') ? 'settings' : 'catalog';
       await sql`
         INSERT INTO public.tenant_cache_versions (user_id, subscription_id, scope, version, updated_at)
@@ -198,7 +225,7 @@ app.post('/api/upload', async (c) => {
 
     return c.json({
       success: true,
-      message: 'File uploaded to R2 and automatically saved to your database!',
+      message: 'File uploaded, replaced previous file, and saved to database!',
       file_key: fileKey,
       url: publicUrl,
       saved_entity: savedEntity,
