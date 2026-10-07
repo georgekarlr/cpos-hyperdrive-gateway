@@ -4,6 +4,7 @@ import postgres from 'postgres';
 
 type Bindings = {
   HYPERDRIVE: { connectionString: string };
+  R2_BUCKET: R2Bucket;
   SUPABASE_ORIGIN_URL: string;
   SUPABASE_JWT_SECRET: string;
 };
@@ -88,6 +89,101 @@ app.options('*', (c) => {
 });
 
 // -----------------------------------------------------------------------------
+// 2. CLOUDFLARE R2 FILE UPLOAD ENDPOINT (/api/upload)
+// -----------------------------------------------------------------------------
+app.post('/api/upload', async (c) => {
+  // A. Authenticate via Supabase JWT
+  const authHeader = c.req.header('authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return jsonWithCors(c, { message: 'Unauthorized: User session required.', code: '401' }, 401);
+  }
+
+  let userId: string;
+  try {
+    const token = authHeader.split(' ')[1];
+    const secret = new TextEncoder().encode(c.env.SUPABASE_JWT_SECRET);
+    const { payload } = await jwtVerify(token, secret);
+    userId = payload.sub as string;
+    if (!userId) throw new Error('Missing sub');
+  } catch (err: any) {
+    return jsonWithCors(c, { message: 'Invalid token.', code: '401' }, 401);
+  }
+
+  // B. Parse Multipart Form Data
+  let formData: FormData;
+  try {
+    formData = await c.req.formData();
+  } catch (err) {
+    return jsonWithCors(c, { message: 'Invalid form data. Please upload a file.', code: '400' }, 400);
+  }
+
+  const file = formData.get('file') as File | null;
+  const docType = (formData.get('type') as string) || 'documents'; // '2303', '2307', 'products'
+
+  if (!file) {
+    return jsonWithCors(c, { message: 'No file provided.', code: '400' }, 400);
+  }
+
+  // C. Size limit (max 15MB) & Allowed extensions check
+  if (file.size > 15 * 1024 * 1024) {
+    return jsonWithCors(c, { message: 'File exceeds 15MB size limit.', code: '400' }, 400);
+  }
+
+  const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+  if (!allowedTypes.includes(file.type)) {
+    return jsonWithCors(c, { message: 'Only PDF, PNG, JPG, and WEBP files are allowed.', code: '400' }, 400);
+  }
+
+  // D. Generate Unique File Key in 'ceintelly' R2 Bucket
+  const extension = file.name.split('.').pop() || 'bin';
+  const fileKey = `${docType}/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
+
+  // E. Save to R2
+  const arrayBuffer = await file.arrayBuffer();
+  await c.env.R2_BUCKET.put(fileKey, arrayBuffer, {
+    httpMetadata: {
+      contentType: file.type,
+    },
+    customMetadata: {
+      uploadedBy: userId,
+      originalName: file.name,
+      docType: docType,
+    },
+  });
+
+  // F. Return Public URL
+  const workerUrl = new URL(c.req.url).origin;
+  const publicUrl = `${workerUrl}/files/${fileKey}`;
+
+  return jsonWithCors(c, {
+    success: true,
+    message: 'File uploaded to R2 successfully.',
+    file_key: fileKey,
+    url: publicUrl,
+  });
+});
+
+// -----------------------------------------------------------------------------
+// 3. SERVE FILES DIRECTLY FROM CLOUDFLARE R2 (/files/*)
+// -----------------------------------------------------------------------------
+app.get('/files/:key{.+}', async (c) => {
+  const key = c.req.param('key');
+  const object = await c.env.R2_BUCKET.get(key);
+
+  if (!object) {
+    return c.text('File not found in R2.', 404);
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set('etag', object.httpEtag);
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable'); // Cache in browser for 1 year
+  setCorsHeaders(c.req.raw, headers);
+
+  return new Response(object.body, { headers });
+});
+
+// -----------------------------------------------------------------------------
 // FUNCTION WHITELISTS
 // -----------------------------------------------------------------------------
 // A. Public / Unauthenticated RPCs (Called without a logged-in user session)
@@ -111,7 +207,7 @@ const EXTRA_AUTH_FUNCTIONS = new Set([
 
 // C. Read-only procedures utilizing Hyperdrive Edge Caching
 // NOTE: pos2_get_terminal_state, pos2_get_rentable_assets, and c_get_my_notifications
-// are strictly EXCLUDED so real-time counters, room occupancy, and alerts are always 100% live!
+// are strictly EXCLUDED so counters and room occupancy are always live!
 const CACHEABLE_READ_PROCEDURES = new Set([
   // Products, Catalog, Services & Inventory Lookups
   'pos2_get_product_details',
@@ -173,6 +269,7 @@ const CACHEABLE_READ_PROCEDURES = new Set([
   'pos2_get_installment_payments_by_order',
 
   // Market Website Reads
+  'c_get_business_settings',
   'c_get_marketplace_products',
   'c_get_subscription_invoice',
   'c_get_my_subscription_invoices',
@@ -229,7 +326,7 @@ function getProcedureScope(procName: string): string {
 }
 
 // -----------------------------------------------------------------------------
-// 2. RPC INTERCEPTOR (HYPERDRIVE CONNECTION POOL)
+// 4. RPC INTERCEPTOR (HYPERDRIVE CONNECTION POOL)
 // -----------------------------------------------------------------------------
 app.post('/rest/v1/rpc/:functionName', async (c) => {
   const functionName = c.req.param('functionName');
@@ -284,9 +381,8 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
   // Smart Type-Aware Argument Sanitizer:
   // - Preserves native PostgreSQL arrays (bigint[], text[] like p_eligible_product_ids)
   // - Serializes JSONB payloads (p_cart_items, p_payments, p_items_to_debt) cleanly
-  // - Handles B2B strings and numbers without corruption
   const argValues = Object.entries(args).map(([key, val]) => {
-    // A. Native PostgreSQL array parameters (e.g. p_eligible_product_ids bigint[])
+    // A. Native PostgreSQL array parameters
     if (
       key.includes('eligible_product_ids') || 
       key.endsWith('_array') || 
@@ -314,7 +410,7 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
     // C. If it's a JSONB array of objects or an object, serialize as a JSON string
     if (val !== null && typeof val === 'object') {
       if (Array.isArray(val) && (val.length === 0 || typeof val[0] !== 'object')) {
-        return val; // Array of primitives
+        return val;
       }
       return JSON.stringify(val);
     }
@@ -366,7 +462,6 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
     } else {
       // -----------------------------------------------------------------------
       // DIRECT TRANSACTIONAL PIPELINE (Sales, Voids, Rentals, Mutations)
-      // Strict BEGIN ... COMMIT ensures Hyperdrive bypasses edge cache
       // -----------------------------------------------------------------------
       const result = await sql.begin(async (tx) => {
         if (userId) {
@@ -402,7 +497,7 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// 3. REVERSE PROXY FOR SUPABASE AUTH & STORAGE
+// 5. REVERSE PROXY FOR SUPABASE AUTH & STORAGE
 // -----------------------------------------------------------------------------
 app.all('*', async (c) => {
   return proxyToSupabase(c);
@@ -416,6 +511,7 @@ async function proxyToSupabase(c: any) {
     targetUrl.pathname = originUrl.pathname;
     targetUrl.search = originUrl.search;
 
+    // Filter out forbidden headers: NEVER set 'host' manually in Workers fetch
     const reqHeaders = new Headers();
     for (const [key, value] of c.req.raw.headers.entries()) {
       const lower = key.toLowerCase();
