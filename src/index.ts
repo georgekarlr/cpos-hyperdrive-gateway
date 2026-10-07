@@ -89,7 +89,7 @@ app.options('*', (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// 2. CLOUDFLARE R2 FILE UPLOAD ENDPOINT (/api/upload)
+// 2. 1-STEP R2 UPLOAD + AUTOMATIC DATABASE SAVE (/api/upload)
 // -----------------------------------------------------------------------------
 app.post('/api/upload', async (c) => {
   // A. Authenticate via Supabase JWT
@@ -118,7 +118,8 @@ app.post('/api/upload', async (c) => {
   }
 
   const file = formData.get('file') as File | null;
-  const docType = (formData.get('type') as string) || 'documents'; // '2303', '2307', 'products'
+  const docType = (formData.get('type') as string) || 'documents'; // '2303', '2307', 'product_image'
+  const productId = formData.get('product_id') as string | null;
 
   if (!file) {
     return jsonWithCors(c, { message: 'No file provided.', code: '400' }, 400);
@@ -134,16 +135,13 @@ app.post('/api/upload', async (c) => {
     return jsonWithCors(c, { message: 'Only PDF, PNG, JPG, and WEBP files are allowed.', code: '400' }, 400);
   }
 
-  // D. Generate Unique File Key in 'ceintelly' R2 Bucket
+  // D. Save to Cloudflare R2 ('ceintelly' bucket)
   const extension = file.name.split('.').pop() || 'bin';
   const fileKey = `${docType}/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
 
-  // E. Save to R2
   const arrayBuffer = await file.arrayBuffer();
   await c.env.R2_BUCKET.put(fileKey, arrayBuffer, {
-    httpMetadata: {
-      contentType: file.type,
-    },
+    httpMetadata: { contentType: file.type },
     customMetadata: {
       uploadedBy: userId,
       originalName: file.name,
@@ -151,15 +149,71 @@ app.post('/api/upload', async (c) => {
     },
   });
 
-  // F. Return Public URL
   const workerUrl = new URL(c.req.url).origin;
   const publicUrl = `${workerUrl}/files/${fileKey}`;
 
+  // E. AUTOMATIC DATABASE SAVE VIA HYPERDRIVE!
+  const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
+  let savedEntity = 'none';
+
+  try {
+    if (docType === '2303') {
+      // Auto-save BIR Form 2303 URL directly to pos2_business_settings
+      await sql`
+        INSERT INTO public.pos2_business_settings (user_id, bir_2303_url, bir_2303_status, updated_at)
+        VALUES (${userId}, ${publicUrl}, 'pending', NOW())
+        ON CONFLICT (user_id) DO UPDATE SET 
+          bir_2303_url = ${publicUrl},
+          bir_2303_status = 'pending',
+          updated_at = NOW();
+      `;
+      savedEntity = 'business_settings_2303';
+
+    } else if (docType === '2307') {
+      // Auto-save BIR Form 2307 URL directly to pos2_business_settings
+      await sql`
+        INSERT INTO public.pos2_business_settings (user_id, bir_2307_url, bir_2307_status, updated_at)
+        VALUES (${userId}, ${publicUrl}, 'pending', NOW())
+        ON CONFLICT (user_id) DO UPDATE SET 
+          bir_2307_url = ${publicUrl},
+          bir_2307_status = 'pending',
+          updated_at = NOW();
+      `;
+      savedEntity = 'business_settings_2307';
+
+    } else if (docType === 'product_image' && productId) {
+      // Auto-save Product Image directly to pos2_products
+      await sql`
+        UPDATE public.pos2_products
+        SET image_url = ${publicUrl}, updated_at = NOW()
+        WHERE id = ${Number(productId)} AND user_id = ${userId};
+      `;
+      savedEntity = 'product_image';
+    }
+
+    // Bump tenant cache version automatically
+    const scope = docType.startsWith('230') ? 'settings' : 'catalog';
+    await sql`
+      INSERT INTO public.tenant_cache_versions (user_id, subscription_id, scope, version, updated_at)
+      VALUES (${userId}, 1, ${scope}, EXTRACT(EPOCH FROM NOW())::BIGINT, NOW())
+      ON CONFLICT (user_id, subscription_id, scope) 
+      DO UPDATE SET 
+        version = EXTRACT(EPOCH FROM NOW())::BIGINT,
+        updated_at = NOW();
+    `;
+  } catch (dbErr: any) {
+    console.error('[Upload DB Auto-Save Error]:', dbErr);
+  } finally {
+    await sql.end();
+  }
+
+  // F. Return Complete Success
   return jsonWithCors(c, {
     success: true,
-    message: 'File uploaded to R2 successfully.',
+    message: 'File uploaded to R2 and automatically saved to your database!',
     file_key: fileKey,
     url: publicUrl,
+    saved_entity: savedEntity,
   });
 });
 
@@ -186,7 +240,7 @@ app.get('/files/:key{.+}', async (c) => {
 // -----------------------------------------------------------------------------
 // FUNCTION WHITELISTS
 // -----------------------------------------------------------------------------
-// A. Public / Unauthenticated RPCs (Called without a logged-in user session)
+// A. Public / Unauthenticated RPCs (Can be called before login)
 const PUBLIC_ANON_FUNCTIONS = new Set([
   'can_request_password_reset',
   'can_submit_new_password',
@@ -433,7 +487,6 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
       `;
       const currentVersion = verRows.length > 0 ? verRows[0].version : 1;
 
-      // ATOMIC QUERY: Binds user_id ($1) and aliases the table with the function name
       let queryText: string;
       let queryParams: any[];
 
@@ -511,7 +564,6 @@ async function proxyToSupabase(c: any) {
     targetUrl.pathname = originUrl.pathname;
     targetUrl.search = originUrl.search;
 
-    // Filter out forbidden headers: NEVER set 'host' manually in Workers fetch
     const reqHeaders = new Headers();
     for (const [key, value] of c.req.raw.headers.entries()) {
       const lower = key.toLowerCase();
@@ -566,7 +618,6 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
   const keys = Object.keys(rows[0]);
 
   // 1. If PostgreSQL named the column after the function itself
-  // (Scalars: boolean, text, or jsonb object)
   if (rows.length === 1 && keys.length === 1 && keys[0].toLowerCase() === functionName.toLowerCase()) {
     return rows[0][keys[0]];
   }
