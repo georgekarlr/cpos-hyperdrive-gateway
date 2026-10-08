@@ -17,7 +17,7 @@ const app = new Hono<{ Bindings: Bindings }>();
 // -----------------------------------------------------------------------------
 app.use('*', cors({
   origin: (origin) => origin || '*',
-  allowHeaders: ['authorization', 'apikey', 'content-type', 'prefer', 'x-client-info', 'x-supabase-api-version'],
+  allowHeaders: ['authorization', 'apikey', 'content-type','content-profile','accept-profile', 'prefer', 'x-client-info', 'x-supabase-api-version'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   credentials: true,
   maxAge: 86400,
