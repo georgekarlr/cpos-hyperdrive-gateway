@@ -17,7 +17,7 @@ const app = new Hono<{ Bindings: Bindings }>();
 // -----------------------------------------------------------------------------
 app.use('*', cors({
   origin: (origin) => origin || '*',
-  allowHeaders: ['authorization', 'apikey', 'content-type','content-profile','accept-profile', 'prefer', 'x-client-info', 'x-supabase-api-version'],
+  allowHeaders: ['authorization', 'apikey', 'content-type', 'content-profile', 'accept-profile', 'prefer', 'x-client-info', 'x-supabase-api-version'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   credentials: true,
   maxAge: 86400,
@@ -68,9 +68,6 @@ function createDbClient(connectionString: string) {
 }
 
 // -----------------------------------------------------------------------------
-// 2. 1-STEP R2 UPLOAD + AUTOMATIC DATABASE SAVE (/api/upload)
-// -----------------------------------------------------------------------------
-// -----------------------------------------------------------------------------
 // 2. 1-STEP R2 UPLOAD + AUTO-SAVE + AUTO-CLEANUP PREVIOUS FILES (/api/upload)
 // -----------------------------------------------------------------------------
 app.post('/api/upload', async (c) => {
@@ -113,6 +110,7 @@ app.post('/api/upload', async (c) => {
     ).trim();
 
     const productId = formData.get('product_id') as string | null;
+    const orderId = (formData.get('order_id') as string | null) || (formData.get('invoice_id') as string | null);
 
     if (!file) {
       return c.json({ message: 'No file provided in request.', code: '400' }, 400);
@@ -127,17 +125,26 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'Only PDF, PNG, JPG, and WEBP files are allowed.', code: '400' }, 400);
     }
 
-    // 3. Generate Clean File Key
+    // 3. Generate Clean File Key & Cleanup Prefix
     const extension = file.name.split('.').pop() || 'bin';
     let fileKey: string;
     let cleanupPrefix: string | null = null;
 
-    if (docType === '2303' || docType === '2307') {
+    if (orderId && (docType === 'order_2307' || docType === '2307' || docType === 'cwt')) {
+      // Form 2307 Certificate attached to a specific Sales Invoice
+      fileKey = `orders/${userId}/2307-order-${orderId}-${Date.now()}.${extension}`;
+      cleanupPrefix = `orders/${userId}/2307-order-${orderId}-`;
+    } else if (docType === '2303' || docType === '2307') {
+      // Company-level business registration files
       fileKey = `${docType}/${userId}/${Date.now()}.${extension}`;
-      cleanupPrefix = `${docType}/${userId}/`; // Will delete any old 2303/2307 for this user
+      cleanupPrefix = `${docType}/${userId}/`;
     } else if (productId && (docType === 'product_image' || docType === 'products')) {
+      // Product Catalog Image
       fileKey = `products/${userId}/prod-${productId}-${Date.now()}.${extension}`;
-      cleanupPrefix = `products/${userId}/prod-${productId}-`; // Will delete old image for this product
+      cleanupPrefix = `products/${userId}/prod-${productId}-`;
+    } else if (docType === 'feedback' || docType === 'ticket') {
+      // Support Ticket Screenshots / Attachments
+      fileKey = `feedback/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
     } else {
       fileKey = `${docType}/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
     }
@@ -150,15 +157,16 @@ app.post('/api/upload', async (c) => {
         uploadedBy: userId,
         originalName: file.name,
         docType: docType,
+        orderId: orderId || '',
+        productId: productId || '',
       },
     });
 
-    // 5. AUTOMATIC CLEANUP: Delete previous file from R2 so files don't stack!
+    // 5. AUTOMATIC CLEANUP: Delete superseded file so files don't stack in R2
     if (cleanupPrefix) {
       try {
         const existingObjects = await c.env.R2_BUCKET.list({ prefix: cleanupPrefix });
         for (const obj of existingObjects.objects) {
-          // If it's not the file we just uploaded, delete it permanently!
           if (obj.key !== fileKey) {
             await c.env.R2_BUCKET.delete(obj.key);
           }
@@ -176,7 +184,20 @@ app.post('/api/upload', async (c) => {
     let savedEntity = 'none';
 
     try {
-      if (docType === '2303') {
+      if (orderId && (docType === 'order_2307' || docType === '2307' || docType === 'cwt')) {
+        // Automatically save Form 2307 certificate URL onto the invoice
+        await sql`
+          UPDATE public.pos2_orders
+          SET 
+            cwt_certificate_url = ${publicUrl},
+            is_cwt_verified = FALSE,
+            cwt_verified_at = NULL,
+            cwt_verified_by = NULL
+          WHERE id = ${Number(orderId)};
+        `;
+        savedEntity = 'order_2307_certificate';
+
+      } else if (docType === '2303') {
         await sql`
           INSERT INTO public.pos2_business_settings (user_id, bir_2303_url, bir_2303_status, updated_at)
           VALUES (${userId}, ${publicUrl}, 'pending', NOW())
@@ -208,7 +229,7 @@ app.post('/api/upload', async (c) => {
       }
 
       // Bump cache version automatically
-      const scope = docType.includes('230') ? 'settings' : 'catalog';
+      const scope = (docType.includes('230') || orderId) ? 'settings' : (docType === 'feedback' ? 'marketplace' : 'catalog');
       await sql`
         INSERT INTO public.tenant_cache_versions (user_id, subscription_id, scope, version, updated_at)
         VALUES (${userId}, 1, ${scope}, EXTRACT(EPOCH FROM NOW())::BIGINT, NOW())
@@ -229,6 +250,7 @@ app.post('/api/upload', async (c) => {
       file_key: fileKey,
       url: publicUrl,
       saved_entity: savedEntity,
+      order_id: orderId || null,
     });
   } catch (err: any) {
     console.error('[Upload General Error]:', err);
@@ -258,7 +280,6 @@ app.get('/files/:key{.+}', async (c) => {
 // -----------------------------------------------------------------------------
 // FUNCTION WHITELISTS
 // -----------------------------------------------------------------------------
-// A. Public / Unauthenticated RPCs (Called without a logged-in user session)
 const PUBLIC_ANON_FUNCTIONS = new Set([
   'can_request_password_reset',
   'can_submit_new_password',
@@ -266,7 +287,6 @@ const PUBLIC_ANON_FUNCTIONS = new Set([
   'c_get_marketplace_products',
 ]);
 
-// B. Staff/Security procedures that don't start with pos2_ or c_
 const EXTRA_AUTH_FUNCTIONS = new Set([
   'validate_pos_account_password',
   'validate_pos_staff_user',
@@ -277,9 +297,6 @@ const EXTRA_AUTH_FUNCTIONS = new Set([
   'pos_can_view_reports',
 ]);
 
-// C. Read-only procedures utilizing Hyperdrive Edge Caching
-// NOTE: pos2_get_terminal_state, pos2_get_rentable_assets, and c_get_my_notifications
-// are strictly EXCLUDED so counters and room occupancy are always live!
 const CACHEABLE_READ_PROCEDURES = new Set([
   // Products, Catalog, Services & Inventory Lookups
   'pos2_get_product_details',
@@ -309,9 +326,10 @@ const CACHEABLE_READ_PROCEDURES = new Set([
   'pos2_get_client_terminal_settings',
   'pos2_get_staff_accounts',
 
-  // Historical Sales, Audit & Statutory Books
+  // Historical Sales, Payments Audit & Statutory Books
   'pos2_get_sales_history',
   'pos2_get_sale_details_by_id',
+  'pos2_get_payments_list',           // <-- NEW: Non-cash payments list & audit
   'pos2_get_refundable_items',
   'pos2_get_refund_details',
   'pos2_report_bir_sales_book',
@@ -340,14 +358,19 @@ const CACHEABLE_READ_PROCEDURES = new Set([
   'pos2_get_installment_payment_receipt',
   'pos2_get_installment_payments_by_order',
 
-  // Market Website Reads
+  // Market Website Reads & CWT Reconciliation
   'c_get_business_settings',
   'c_get_marketplace_products',
   'c_get_subscription_invoice',
   'c_get_my_subscription_invoices',
+  'c_get_my_cwt_invoices',            // <-- NEW: Merchant CWT Invoices
+  'c_admin_get_cwt_reconciliation',   // <-- NEW: Admin CWT Reconciliation List
+
+  // Conversational Support Tickets Reads
+  'c_get_feedback_threads',           // <-- NEW: Support Tickets List
+  'c_get_feedback_thread_details',    // <-- NEW: Support Ticket Messages
 ]);
 
-// Determine tenant cache scope for invalidation matching
 function getProcedureScope(procName: string): string {
   if (
     procName.includes('product') || 
@@ -383,14 +406,17 @@ function getProcedureScope(procName: string): string {
     procName.includes('pnl') ||
     procName.includes('ledger') ||
     procName.includes('sales_book') ||
-    procName.includes('audit')
+    procName.includes('audit') ||
+    procName.includes('payment')
   ) {
     return 'reports';
   }
   if (
     procName.includes('marketplace') || 
     procName.includes('notification') || 
-    procName.includes('subscription')
+    procName.includes('subscription') ||
+    procName.includes('feedback') ||
+    procName.includes('cwt')
   ) {
     return 'marketplace';
   }
@@ -413,7 +439,7 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
     return proxyToSupabase(c);
   }
 
-  // 1. Resolve User ID (Authenticated vs Anonymous calls)
+  // 1. Resolve User ID
   const isPublicCall = PUBLIC_ANON_FUNCTIONS.has(functionName);
   let userId: string | null = null;
   const authHeader = c.req.header('authorization');
@@ -444,25 +470,24 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
     return c.json({ message: 'Malformed JSON payload in RPC request.', code: 'PGRST100' }, 400);
   }
 
-  // 3. Connect to PostgreSQL via Hyperdrive with custom type parsing
+  // 3. Connect to PostgreSQL via Hyperdrive
   const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
-
   const isCacheable = CACHEABLE_READ_PROCEDURES.has(functionName);
   const argKeys = Object.keys(args);
 
   // Smart Type-Aware Argument Sanitizer:
-  // - Preserves native PostgreSQL arrays (bigint[], text[] like p_eligible_product_ids)
-  // - Serializes JSONB payloads (p_cart_items, p_payments, p_items_to_debt) cleanly
-  // - Handles B2B strings and numbers without corruption
+  // - Preserves native PostgreSQL arrays ONLY when the parameter expects bigint[] or text[]
+  // - Serializes ALL JSONB payloads (p_cart_items, p_payments, p_attachments, p_items_to_debt) as valid JSON strings
   const argValues = Object.entries(args).map(([key, val]) => {
-    // A. Native PostgreSQL array parameters
-    if (
+    // A. Native PostgreSQL array parameters (bigint[] / text[] in stored procs)
+    const isNativePgArrayParam = 
       key.includes('eligible_product_ids') || 
       key.endsWith('_array') || 
-      (key.endsWith('_ids') && Array.isArray(val))
-    ) {
+      (key.endsWith('_ids') && Array.isArray(val) && !key.includes('cart') && !key.includes('items'));
+
+    if (isNativePgArrayParam) {
       if (Array.isArray(val)) {
-        return val; // Native JS array -> postgres.js sends valid Postgres array syntax: {}
+        return val; // Sends as Postgres array literal: {1,2,3}
       }
       if (val === null || val === undefined || val === '' || val === '[]') {
         return [];
@@ -470,22 +495,14 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
       return val;
     }
 
-    // B. If it's already a valid JSON string (e.g. "[{...}]"), keep it as is
+    // B. If it's already a valid JSON string (e.g. "[{...}]" or '["https://..."]'), pass as-is
     if (typeof val === 'string' && (val.startsWith('[') || val.startsWith('{'))) {
-      try {
-        JSON.parse(val);
-        return val;
-      } catch {
-        return val;
-      }
+      return val;
     }
 
-    // C. If it's a JSONB array of objects or an object, serialize as a JSON string
+    // C. All other objects and JSONB arrays (e.g. p_attachments, p_cart_items, p_payments) MUST be JSON stringified
     if (val !== null && typeof val === 'object') {
-      if (Array.isArray(val) && (val.length === 0 || typeof val[0] !== 'object')) {
-        return val; // Array of primitives
-      }
-      return JSON.stringify(val);
+      return JSON.stringify(val); // Sends as valid JSON string: ["https://..."]
     }
 
     return val;
@@ -506,7 +523,6 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
       `;
       const currentVersion = verRows.length > 0 ? verRows[0].version : 1;
 
-      // ATOMIC QUERY: Binds user_id ($1) and aliases the table with the function name
       let queryText: string;
       let queryParams: any[];
 
@@ -534,8 +550,7 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
 
     } else {
       // -----------------------------------------------------------------------
-      // DIRECT TRANSACTIONAL PIPELINE (Sales, Voids, Rentals, Mutations)
-      // Strict BEGIN ... COMMIT ensures Hyperdrive bypasses edge cache
+      // DIRECT TRANSACTIONAL PIPELINE (Mutations, Checkouts, Voids, Settlements)
       // -----------------------------------------------------------------------
       const result = await sql.begin(async (tx) => {
         if (userId) {
@@ -625,8 +640,7 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
 
   const keys = Object.keys(rows[0]);
 
-  // 1. If PostgreSQL named the column after the function itself
-  // (Scalars: boolean, text, or jsonb object)
+  // 1. If PostgreSQL named the column after the function itself (Scalars: boolean, text, or jsonb object)
   if (rows.length === 1 && keys.length === 1 && keys[0].toLowerCase() === functionName.toLowerCase()) {
     return rows[0][keys[0]];
   }
