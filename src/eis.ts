@@ -117,7 +117,7 @@ export function formatBirEisPayload(
     ? rawSellerTin.split('-')[3] || '00000'
     : '00000';
 
-  // Format Buyer TIN (if B2B or commercial customer)
+  // Format Buyer TIN (for B2B commercial entities or individual consumers)
   const rawBuyerTin = (order.b2b_tin || order.customer_id_reference || '').replace(/[^0-9-]/g, '');
   const buyerBaseTin = rawBuyerTin.length >= 9 ? rawBuyerTin.replace(/-/g, '').slice(0, 9) : '000000000';
   const buyerBranchCode = rawBuyerTin.includes('-')
@@ -204,8 +204,8 @@ export function formatBirEisPayload(
       totalAmountDue: parseFloat(parseFloat(order.total_amount || 0).toFixed(2)),
       withholdingTax: {
         totalCwt: parseFloat(parseFloat(order.withholding_tax_amount || 0).toFixed(2)),
-        cwtGoods: parseFloat(parseFloat(order.cwt_goods_amount || 0).toFixed(2)),       // 1% Goods (ATC WC 158) [1, 2]
-        cwtServices: parseFloat(parseFloat(order.cwt_services_amount || 0).toFixed(2)), // 2% Services (ATC WC 160) [1, 2]
+        cwtGoods: parseFloat(parseFloat(order.cwt_goods_amount || 0).toFixed(2)),       // 1% Goods (ATC WC 158)
+        cwtServices: parseFloat(parseFloat(order.cwt_services_amount || 0).toFixed(2)), // 2% Services (ATC WC 160)
         form2307Ref: order.bir_form_2307_ref || null,
       },
       surcharges: {
