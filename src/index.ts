@@ -8,8 +8,10 @@ import {
   getBirAuthToken, 
   transmitInvoiceToBir, 
   transmitBatchToBir,
-  inquireInvoiceStatus
+  inquireInvoiceStatus,
+  EisCredentials
 } from './eis';
+import { sweepAndTransmitAllActiveEisMerchants } from './eis-sweep';
 
 type Bindings = {
   HYPERDRIVE: { connectionString: string };
@@ -43,7 +45,7 @@ app.use('*', cors({
 // -----------------------------------------------------------------------------
 // POSTGRES CONNECTION FACTORY (PARSING NUMERICS & PRESERVING WALL-CLOCK DATES)
 // -----------------------------------------------------------------------------
-function createDbClient(connectionString: string) {
+export function createDbClient(connectionString: string) {
   return postgres(connectionString, {
     max: 1,
     idle_timeout: 10,
@@ -364,21 +366,16 @@ app.post('/api/eis/transmit-order/:orderId', async (c) => {
     const payload = formatBirEisPayload(order, items, bizSettings);
     const signedJws = await signEisPayload(payload, eisSettings.private_signing_key);
 
-    const authToken = await getBirAuthToken({
+    const creds: EisCredentials = {
       clientId: eisSettings.client_id,
       clientSecret: eisSettings.client_secret,
       privateSigningKey: eisSettings.private_signing_key,
       pttNumber: eisSettings.ptt_number,
       environment: eisSettings.environment as 'sandbox' | 'production',
-    });
+    };
 
-    const transmissionResult = await transmitInvoiceToBir(signedJws, authToken, {
-      clientId: eisSettings.client_id,
-      clientSecret: eisSettings.client_secret,
-      privateSigningKey: eisSettings.private_signing_key,
-      pttNumber: eisSettings.ptt_number,
-      environment: eisSettings.environment as 'sandbox' | 'production',
-    });
+    const authToken = await getBirAuthToken(creds);
+    const transmissionResult = await transmitInvoiceToBir(signedJws, authToken, creds);
 
     await sql`
       UPDATE public.pos2_orders
@@ -488,12 +485,12 @@ app.post('/api/eis/transmit-batch', async (c) => {
       })
     );
 
-    const creds: any = {
+    const creds: EisCredentials = {
       clientId: eisSettings.client_id,
       clientSecret: eisSettings.client_secret,
       privateSigningKey: eisSettings.private_signing_key,
       pttNumber: eisSettings.ptt_number,
-      environment: eisSettings.environment,
+      environment: eisSettings.environment as 'sandbox' | 'production',
     };
 
     const authToken = await getBirAuthToken(creds);
@@ -560,12 +557,12 @@ app.get('/api/eis/status/:ackId', async (c) => {
       return c.json({ success: false, message: 'EIS settings not configured.' }, 400);
     }
 
-    const creds: any = {
+    const creds: EisCredentials = {
       clientId: eisSettings.client_id,
       clientSecret: eisSettings.client_secret,
       privateSigningKey: eisSettings.private_signing_key,
       pttNumber: eisSettings.ptt_number,
-      environment: eisSettings.environment,
+      environment: eisSettings.environment as 'sandbox' | 'production',
     };
 
     const authToken = await getBirAuthToken(creds);
@@ -574,6 +571,24 @@ app.get('/api/eis/status/:ackId', async (c) => {
     return c.json({ success: true, result: statusResult });
   } catch (err: any) {
     return c.json({ success: false, error: err.message || err }, 500);
+  } finally {
+    await sql.end();
+  }
+});
+
+// D. MANUAL ON-DEMAND SWEEPER (For Testing / Superadmin)
+app.post('/api/eis/sweep-all', async (c) => {
+  const authHeader = c.req.header('authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, message: 'Unauthorized.' }, 401);
+  }
+
+  const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
+  try {
+    const result = await sweepAndTransmitAllActiveEisMerchants(sql);
+    return c.json({ success: true, result });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message }, 500);
   } finally {
     await sql.end();
   }
@@ -718,7 +733,7 @@ function getProcedureScope(procName: string): string {
   if (
     procName.includes('marketplace') || 
     procName.includes('notification') || 
-    procName.includes('subscription') ||
+    procName.includes('subscription') || 
     procName.includes('feedback') ||
     procName.includes('cwt')
   ) {
@@ -941,12 +956,12 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
 
   const keys = Object.keys(rows[0]);
 
-  // Scalars: boolean, text, or jsonb object where column is named after function
+  // 1. If PostgreSQL named the column after the function itself (Scalars: boolean, text, or jsonb object)
   if (rows.length === 1 && keys.length === 1 && keys[0].toLowerCase() === functionName.toLowerCase()) {
     return rows[0][keys[0]];
   }
 
-  // Single JSONB object return
+  // 2. If the function returned a single jsonb object under any single column
   if (
     rows.length === 1 &&
     keys.length === 1 &&
@@ -958,8 +973,27 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
     return rows[0][keys[0]];
   }
 
-  // Table row arrays
+  // 3. For functions defined as RETURNS TABLE(...), return the full array of row objects
   return rows;
 }
 
-export default app;
+// -----------------------------------------------------------------------------
+// EXPORT BOTH FETCH (API) AND SCHEDULED (24/7 AUTOMATIC CRON SWEEPER)
+// -----------------------------------------------------------------------------
+export default {
+  fetch: app.fetch,
+
+  // Cloudflare runs this background hook automatically every 5 minutes
+  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    ctx.waitUntil((async () => {
+      const sql = createDbClient(env.HYPERDRIVE.connectionString);
+      try {
+        await sweepAndTransmitAllActiveEisMerchants(sql);
+      } catch (err) {
+        console.error('[Scheduled Cron EIS Background Sweep Error]:', err);
+      } finally {
+        await sql.end();
+      }
+    })());
+  },
+};
