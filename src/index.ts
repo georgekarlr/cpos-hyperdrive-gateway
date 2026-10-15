@@ -11,7 +11,7 @@ type Bindings = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
-
+ 
 // -----------------------------------------------------------------------------
 // 1. OFFICIAL HONO CORS MIDDLEWARE (Handles preflight across all subpaths!)
 // -----------------------------------------------------------------------------
