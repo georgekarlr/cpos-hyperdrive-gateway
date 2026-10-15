@@ -2,6 +2,14 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { jwtVerify } from 'jose';
 import postgres from 'postgres';
+import { 
+  formatBirEisPayload, 
+  signEisPayload, 
+  getBirAuthToken, 
+  transmitInvoiceToBir, 
+  transmitBatchToBir,
+  inquireInvoiceStatus
+} from './eis';
 
 type Bindings = {
   HYPERDRIVE: { connectionString: string };
@@ -11,13 +19,22 @@ type Bindings = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
- 
+
 // -----------------------------------------------------------------------------
-// 1. OFFICIAL HONO CORS MIDDLEWARE (Handles preflight across all subpaths!)
+// 1. OFFICIAL HONO CORS MIDDLEWARE (Handles preflight across all subpaths)
 // -----------------------------------------------------------------------------
 app.use('*', cors({
   origin: (origin) => origin || '*',
-  allowHeaders: ['authorization', 'apikey', 'content-type', 'content-profile', 'accept-profile', 'prefer', 'x-client-info', 'x-supabase-api-version'],
+  allowHeaders: [
+    'authorization', 
+    'apikey', 
+    'content-type', 
+    'content-profile', 
+    'accept-profile', 
+    'prefer', 
+    'x-client-info', 
+    'x-supabase-api-version'
+  ],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   credentials: true,
   maxAge: 86400,
@@ -35,14 +52,14 @@ function createDbClient(connectionString: string) {
       timezone: 'Asia/Manila', // Synchronizes server queries to Philippine Standard Time (UTC+8)
     },
     types: {
-      // 1. Convert PostgreSQL NUMERIC / DECIMAL (OID 1700) to JavaScript Numbers (Float)
+      // 1. Convert PostgreSQL NUMERIC / DECIMAL (OID 1700) to JavaScript Float
       numeric: {
         to: 1700,
         from: [1700],
         serialize: (x: any) => '' + x,
         parse: (x: any) => (x === null ? null : parseFloat(x)),
       },
-      // 2. Convert PostgreSQL BIGINT (OID 20) to JavaScript Numbers (Int)
+      // 2. Convert PostgreSQL BIGINT (OID 20) to JavaScript Numbers
       int8: {
         to: 20,
         from: [20],
@@ -76,7 +93,7 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'Server configuration error: R2 bucket not bound.', code: '500' }, 500);
     }
 
-    // 1. Authenticate via Supabase JWT
+    // Authenticate via Supabase JWT
     const authHeader = c.req.header('authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return c.json({ message: 'Unauthorized: User session required.', code: '401' }, 401);
@@ -93,7 +110,6 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'Invalid token or session expired.', details: err.message, code: '401' }, 401);
     }
 
-    // 2. Parse Multipart Form Data
     let formData: FormData;
     try {
       formData = await c.req.formData();
@@ -125,31 +141,27 @@ app.post('/api/upload', async (c) => {
       return c.json({ message: 'Only PDF, PNG, JPG, and WEBP files are allowed.', code: '400' }, 400);
     }
 
-    // 3. Generate Clean File Key & Cleanup Prefix
+    // Generate Clean File Key & Cleanup Prefix
     const extension = file.name.split('.').pop() || 'bin';
     let fileKey: string;
     let cleanupPrefix: string | null = null;
 
     if (orderId && (docType === 'order_2307' || docType === '2307' || docType === 'cwt')) {
-      // Form 2307 Certificate attached to a specific Sales Invoice
       fileKey = `orders/${userId}/2307-order-${orderId}-${Date.now()}.${extension}`;
       cleanupPrefix = `orders/${userId}/2307-order-${orderId}-`;
     } else if (docType === '2303' || docType === '2307') {
-      // Company-level business registration files
       fileKey = `${docType}/${userId}/${Date.now()}.${extension}`;
       cleanupPrefix = `${docType}/${userId}/`;
     } else if (productId && (docType === 'product_image' || docType === 'products')) {
-      // Product Catalog Image
       fileKey = `products/${userId}/prod-${productId}-${Date.now()}.${extension}`;
       cleanupPrefix = `products/${userId}/prod-${productId}-`;
     } else if (docType === 'feedback' || docType === 'ticket') {
-      // Support Ticket Screenshots / Attachments
       fileKey = `feedback/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
     } else {
       fileKey = `${docType}/${userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${extension}`;
     }
 
-    // 4. Save New File to R2
+    // Save New File to R2
     const arrayBuffer = await file.arrayBuffer();
     await c.env.R2_BUCKET.put(fileKey, arrayBuffer, {
       httpMetadata: { contentType: file.type },
@@ -162,7 +174,7 @@ app.post('/api/upload', async (c) => {
       },
     });
 
-    // 5. AUTOMATIC CLEANUP: Delete superseded file so files don't stack in R2
+    // Delete superseded files in background
     if (cleanupPrefix) {
       try {
         const existingObjects = await c.env.R2_BUCKET.list({ prefix: cleanupPrefix });
@@ -179,13 +191,12 @@ app.post('/api/upload', async (c) => {
     const workerUrl = new URL(c.req.url).origin;
     const publicUrl = `${workerUrl}/files/${fileKey}`;
 
-    // 6. AUTOMATIC DATABASE SAVE VIA HYPERDRIVE
+    // Auto-Save into Database via Hyperdrive
     const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
     let savedEntity = 'none';
 
     try {
       if (orderId && (docType === 'order_2307' || docType === '2307' || docType === 'cwt')) {
-        // Automatically save Form 2307 certificate URL onto the invoice
         await sql`
           UPDATE public.pos2_orders
           SET 
@@ -228,7 +239,7 @@ app.post('/api/upload', async (c) => {
         savedEntity = 'product_image';
       }
 
-      // Bump cache version automatically
+      // Bump tenant cache version
       const scope = (docType.includes('230') || orderId) ? 'settings' : (docType === 'feedback' ? 'marketplace' : 'catalog');
       await sql`
         INSERT INTO public.tenant_cache_versions (user_id, subscription_id, scope, version, updated_at)
@@ -278,7 +289,298 @@ app.get('/files/:key{.+}', async (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// FUNCTION WHITELISTS
+// 4. BIR EIS API TRANSMISSION ENDPOINTS
+// -----------------------------------------------------------------------------
+
+// A. TRANSMIT SINGLE INVOICE (For Certification Testing on eis-cert.bir.gov.ph)
+app.post('/api/eis/transmit-order/:orderId', async (c) => {
+  const orderId = Number(c.req.param('orderId'));
+  if (!orderId) {
+    return c.json({ success: false, message: 'Valid Order ID required.' }, 400);
+  }
+
+  const authHeader = c.req.header('authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, message: 'Unauthorized: User session required.' }, 401);
+  }
+
+  let userId: string;
+  try {
+    const token = authHeader.split(' ')[1];
+    const secret = new TextEncoder().encode(c.env.SUPABASE_JWT_SECRET);
+    const { payload } = await jwtVerify(token, secret);
+    userId = payload.sub as string;
+  } catch (err: any) {
+    return c.json({ success: false, message: 'Invalid token.', details: err.message }, 401);
+  }
+
+  const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
+
+  try {
+    const [eisSettings] = await sql`
+      SELECT * FROM public.pos2_eis_settings 
+      WHERE user_id = ${userId} AND is_active = TRUE 
+      LIMIT 1;
+    `;
+
+    if (!eisSettings || !eisSettings.client_id || !eisSettings.private_signing_key) {
+      return c.json({
+        success: false,
+        message: 'BIR EIS credentials not configured or inactive. Please configure Client ID and Private Key in EIS Settings.',
+      }, 400);
+    }
+
+    const [order] = await sql`
+      SELECT o.*, t.terminal_name, t.min, t.ptu_number 
+      FROM public.pos2_orders o
+      LEFT JOIN public.pos2_terminals t ON o.terminal_id = t.id
+      WHERE o.id = ${orderId} AND o.user_id = ${userId};
+    `;
+
+    if (!order) {
+      return c.json({ success: false, message: 'Order not found or access denied.' }, 404);
+    }
+
+    if (order.eis_status === 'transmitted') {
+      return c.json({
+        success: true,
+        message: 'This invoice has already been successfully transmitted to the BIR EIS.',
+        ackId: order.eis_ack_id,
+        transmitted_at: order.eis_transmitted_at,
+      });
+    }
+
+    const items = await sql`
+      SELECT oi.*, p.name AS product_name, COALESCE(p.item_type, 'goods') AS item_type
+      FROM public.pos2_order_items oi
+      JOIN public.pos2_products p ON oi.product_id = p.id
+      WHERE oi.order_id = ${orderId};
+    `;
+
+    const [bizSettings] = await sql`
+      SELECT * FROM public.pos2_business_settings WHERE user_id = ${userId} LIMIT 1;
+    `;
+
+    const payload = formatBirEisPayload(order, items, bizSettings);
+    const signedJws = await signEisPayload(payload, eisSettings.private_signing_key);
+
+    const authToken = await getBirAuthToken({
+      clientId: eisSettings.client_id,
+      clientSecret: eisSettings.client_secret,
+      privateSigningKey: eisSettings.private_signing_key,
+      pttNumber: eisSettings.ptt_number,
+      environment: eisSettings.environment as 'sandbox' | 'production',
+    });
+
+    const transmissionResult = await transmitInvoiceToBir(signedJws, authToken, {
+      clientId: eisSettings.client_id,
+      clientSecret: eisSettings.client_secret,
+      privateSigningKey: eisSettings.private_signing_key,
+      pttNumber: eisSettings.ptt_number,
+      environment: eisSettings.environment as 'sandbox' | 'production',
+    });
+
+    await sql`
+      UPDATE public.pos2_orders
+      SET 
+        eis_status = 'transmitted',
+        eis_ack_id = ${transmissionResult.ackId},
+        eis_transmitted_at = NOW()
+      WHERE id = ${orderId};
+    `;
+
+    return c.json({
+      success: true,
+      message: 'Invoice successfully signed, transmitted, and acknowledged by BIR EIS!',
+      order_id: orderId,
+      invoice_number: order.invoice_number,
+      ackId: transmissionResult.ackId,
+      status: transmissionResult.status,
+    });
+  } catch (err: any) {
+    console.error('[BIR EIS Single Transmission Error]:', err);
+    return c.json({
+      success: false,
+      message: 'BIR EIS Transmission Failed.',
+      details: err.message || err,
+    }, 500);
+  } finally {
+    await sql.end();
+  }
+});
+
+// B. TRANSMIT BATCH (Up to 100 Pending Invoices in 1 Single BIR API Call)
+app.post('/api/eis/transmit-batch', async (c) => {
+  const authHeader = c.req.header('authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, message: 'Unauthorized: User session required.' }, 401);
+  }
+
+  let userId: string;
+  try {
+    const token = authHeader.split(' ')[1];
+    const secret = new TextEncoder().encode(c.env.SUPABASE_JWT_SECRET);
+    const { payload } = await jwtVerify(token, secret);
+    userId = payload.sub as string;
+  } catch (err: any) {
+    return c.json({ success: false, message: 'Invalid token.', details: err.message }, 401);
+  }
+
+  const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
+
+  try {
+    const [eisSettings] = await sql`
+      SELECT * FROM public.pos2_eis_settings 
+      WHERE user_id = ${userId} AND is_active = TRUE 
+      LIMIT 1;
+    `;
+
+    if (!eisSettings || !eisSettings.client_id || !eisSettings.private_signing_key) {
+      return c.json({
+        success: false,
+        message: 'BIR EIS credentials not configured or inactive.',
+      }, 400);
+    }
+
+    const [bizSettings] = await sql`
+      SELECT * FROM public.pos2_business_settings WHERE user_id = ${userId} LIMIT 1;
+    `;
+
+    const pendingOrders = await sql`
+      SELECT o.*, t.terminal_name, t.min, t.ptu_number 
+      FROM public.pos2_orders o
+      LEFT JOIN public.pos2_terminals t ON o.terminal_id = t.id
+      WHERE o.user_id = ${userId}
+        AND o.eis_status = 'pending'
+      ORDER BY COALESCE(o.occurred_at, o.created_at) ASC
+      LIMIT 100;
+    `;
+
+    if (pendingOrders.length === 0) {
+      return c.json({
+        success: true,
+        message: 'No pending invoices to transmit. All sales are up to date.',
+        transmitted_count: 0,
+      });
+    }
+
+    const orderIds = pendingOrders.map((o) => o.id);
+
+    const allItems = await sql`
+      SELECT oi.*, p.name AS product_name, COALESCE(p.item_type, 'goods') AS item_type
+      FROM public.pos2_order_items oi
+      JOIN public.pos2_products p ON oi.product_id = p.id
+      WHERE oi.order_id = ANY(${orderIds});
+    `;
+
+    const itemsByOrder: Record<number, any[]> = {};
+    for (const item of allItems) {
+      if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
+      itemsByOrder[item.order_id].push(item);
+    }
+
+    // Sign all invoices in parallel using Web Crypto
+    const signedJwsList: string[] = await Promise.all(
+      pendingOrders.map(async (order) => {
+        const orderItems = itemsByOrder[order.id] || [];
+        const payload = formatBirEisPayload(order, orderItems, bizSettings);
+        return await signEisPayload(payload, eisSettings.private_signing_key);
+      })
+    );
+
+    const creds: any = {
+      clientId: eisSettings.client_id,
+      clientSecret: eisSettings.client_secret,
+      privateSigningKey: eisSettings.private_signing_key,
+      pttNumber: eisSettings.ptt_number,
+      environment: eisSettings.environment,
+    };
+
+    const authToken = await getBirAuthToken(creds);
+    const batchResponse = await transmitBatchToBir(signedJwsList, authToken, creds);
+
+    const globalAckId = batchResponse.batchAckId || batchResponse.ackId || `BATCH-ACK-${Date.now()}`;
+
+    await sql`
+      UPDATE public.pos2_orders
+      SET 
+        eis_status = 'transmitted',
+        eis_ack_id = ${globalAckId},
+        eis_transmitted_at = NOW()
+      WHERE id = ANY(${orderIds});
+    `;
+
+    return c.json({
+      success: true,
+      message: `Successfully transmitted batch of ${pendingOrders.length} invoice(s) to BIR EIS!`,
+      batch_ack_id: globalAckId,
+      invoices_transmitted: pendingOrders.length,
+      invoice_numbers: pendingOrders.map((o) => o.invoice_number),
+    });
+  } catch (err: any) {
+    console.error('[BIR EIS Batch Transmission Error]:', err);
+    return c.json({
+      success: false,
+      message: 'BIR EIS Batch Transmission Failed.',
+      details: err.message || err,
+    }, 500);
+  } finally {
+    await sql.end();
+  }
+});
+
+// C. INQUIRE TRANSMISSION STATUS FROM BIR VIA ACKID
+app.get('/api/eis/status/:ackId', async (c) => {
+  const ackId = c.req.param('ackId');
+  const authHeader = c.req.header('authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ success: false, message: 'Unauthorized.' }, 401);
+  }
+
+  let userId: string;
+  try {
+    const token = authHeader.split(' ')[1];
+    const secret = new TextEncoder().encode(c.env.SUPABASE_JWT_SECRET);
+    const { payload } = await jwtVerify(token, secret);
+    userId = payload.sub as string;
+  } catch (err: any) {
+    return c.json({ success: false, message: 'Invalid token.' }, 401);
+  }
+
+  const sql = createDbClient(c.env.HYPERDRIVE.connectionString);
+
+  try {
+    const [eisSettings] = await sql`
+      SELECT * FROM public.pos2_eis_settings 
+      WHERE user_id = ${userId} AND is_active = TRUE 
+      LIMIT 1;
+    `;
+
+    if (!eisSettings) {
+      return c.json({ success: false, message: 'EIS settings not configured.' }, 400);
+    }
+
+    const creds: any = {
+      clientId: eisSettings.client_id,
+      clientSecret: eisSettings.client_secret,
+      privateSigningKey: eisSettings.private_signing_key,
+      pttNumber: eisSettings.ptt_number,
+      environment: eisSettings.environment,
+    };
+
+    const authToken = await getBirAuthToken(creds);
+    const statusResult = await inquireInvoiceStatus(ackId, authToken, creds);
+
+    return c.json({ success: true, result: statusResult });
+  } catch (err: any) {
+    return c.json({ success: false, error: err.message || err }, 500);
+  } finally {
+    await sql.end();
+  }
+});
+
+// -----------------------------------------------------------------------------
+// 5. FUNCTION WHITELISTS & ROUTING
 // -----------------------------------------------------------------------------
 const PUBLIC_ANON_FUNCTIONS = new Set([
   'can_request_password_reset',
@@ -298,7 +600,7 @@ const EXTRA_AUTH_FUNCTIONS = new Set([
 ]);
 
 const CACHEABLE_READ_PROCEDURES = new Set([
-  // Products, Catalog, Services & Inventory Lookups
+  // Products & Inventory
   'pos2_get_product_details',
   'pos2_get_all_products',
   'pos2_get_product_activity_by_id',
@@ -306,11 +608,11 @@ const CACHEABLE_READ_PROCEDURES = new Set([
   'pos2_report_low_stock_products',
   'pos2_report_inventory_valuation',
 
-  // Promotions Lookups
+  // Promotions
   'pos2_get_promotions',
   'pos2_get_promo_product_prices',
 
-  // Customers & Debt Lookups
+  // Customers & Debt
   'pos2_get_customers',
   'pos2_get_customers_simple',
   'pos2_search_customers',
@@ -320,16 +622,17 @@ const CACHEABLE_READ_PROCEDURES = new Set([
   'pos2_get_customer_installments',
   'pos2_get_all_installment_contracts',
 
-  // Settings & Terminals Lookups
+  // Settings & Terminals
   'pos2_get_business_settings',
+  'pos2_get_eis_settings',
   'pos2_get_terminals',
   'pos2_get_client_terminal_settings',
   'pos2_get_staff_accounts',
 
-  // Historical Sales, Payments Audit & Statutory Books
+  // Sales History, Payments Audit & Statutory Ledgers
   'pos2_get_sales_history',
   'pos2_get_sale_details_by_id',
-  'pos2_get_payments_list',           // <-- NEW: Non-cash payments list & audit
+  'pos2_get_payments_list',
   'pos2_get_refundable_items',
   'pos2_get_refund_details',
   'pos2_report_bir_sales_book',
@@ -354,21 +657,21 @@ const CACHEABLE_READ_PROCEDURES = new Set([
   'pos2_get_dashboard_data',
   'pos2_get_system_audit_trail',
 
-  // Installment Payment Receipts
+  // Installment Receipts
   'pos2_get_installment_payment_receipt',
   'pos2_get_installment_payments_by_order',
 
-  // Market Website Reads & CWT Reconciliation
+  // Marketplace & B2B CWT Invoices
   'c_get_business_settings',
   'c_get_marketplace_products',
   'c_get_subscription_invoice',
   'c_get_my_subscription_invoices',
-  'c_get_my_cwt_invoices',            // <-- NEW: Merchant CWT Invoices
-  'c_admin_get_cwt_reconciliation',   // <-- NEW: Admin CWT Reconciliation List
+  'c_get_my_cwt_invoices',
+  'c_admin_get_cwt_reconciliation',
 
-  // Conversational Support Tickets Reads
-  'c_get_feedback_threads',           // <-- NEW: Support Tickets List
-  'c_get_feedback_thread_details',    // <-- NEW: Support Ticket Messages
+  // Support Tickets (Feedback CRUD)
+  'c_get_feedback_threads',
+  'c_get_feedback_thread_details',
 ]);
 
 function getProcedureScope(procName: string): string {
@@ -392,6 +695,7 @@ function getProcedureScope(procName: string): string {
   }
   if (
     procName.includes('business_settings') || 
+    procName.includes('eis_settings') ||
     procName.includes('terminal') || 
     procName.includes('staff') ||
     procName.includes('asset') ||
@@ -424,7 +728,7 @@ function getProcedureScope(procName: string): string {
 }
 
 // -----------------------------------------------------------------------------
-// 4. RPC INTERCEPTOR (HYPERDRIVE CONNECTION POOL)
+// 6. RPC INTERCEPTOR (HYPERDRIVE CONNECTION POOL)
 // -----------------------------------------------------------------------------
 app.post('/rest/v1/rpc/:functionName', async (c) => {
   const functionName = c.req.param('functionName');
@@ -476,10 +780,9 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
   const argKeys = Object.keys(args);
 
   // Smart Type-Aware Argument Sanitizer:
-  // - Preserves native PostgreSQL arrays ONLY when the parameter expects bigint[] or text[]
-  // - Serializes ALL JSONB payloads (p_cart_items, p_payments, p_attachments, p_items_to_debt) as valid JSON strings
+  // - Preserves native PostgreSQL arrays ONLY when parameter expects bigint[] or text[]
+  // - Serializes ALL JSONB payloads (p_cart_items, p_payments, p_attachments) as valid JSON strings
   const argValues = Object.entries(args).map(([key, val]) => {
-    // A. Native PostgreSQL array parameters (bigint[] / text[] in stored procs)
     const isNativePgArrayParam = 
       key.includes('eligible_product_ids') || 
       key.endsWith('_array') || 
@@ -487,7 +790,7 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
 
     if (isNativePgArrayParam) {
       if (Array.isArray(val)) {
-        return val; // Sends as Postgres array literal: {1,2,3}
+        return val;
       }
       if (val === null || val === undefined || val === '' || val === '[]') {
         return [];
@@ -495,14 +798,12 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
       return val;
     }
 
-    // B. If it's already a valid JSON string (e.g. "[{...}]" or '["https://..."]'), pass as-is
     if (typeof val === 'string' && (val.startsWith('[') || val.startsWith('{'))) {
       return val;
     }
 
-    // C. All other objects and JSONB arrays (e.g. p_attachments, p_cart_items, p_payments) MUST be JSON stringified
     if (val !== null && typeof val === 'object') {
-      return JSON.stringify(val); // Sends as valid JSON string: ["https://..."]
+      return JSON.stringify(val);
     }
 
     return val;
@@ -586,7 +887,7 @@ app.post('/rest/v1/rpc/:functionName', async (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// 5. REVERSE PROXY FOR SUPABASE AUTH & STORAGE
+// 7. REVERSE PROXY FOR SUPABASE AUTH & STORAGE
 // -----------------------------------------------------------------------------
 app.all('*', async (c) => {
   return proxyToSupabase(c);
@@ -640,12 +941,12 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
 
   const keys = Object.keys(rows[0]);
 
-  // 1. If PostgreSQL named the column after the function itself (Scalars: boolean, text, or jsonb object)
+  // Scalars: boolean, text, or jsonb object where column is named after function
   if (rows.length === 1 && keys.length === 1 && keys[0].toLowerCase() === functionName.toLowerCase()) {
     return rows[0][keys[0]];
   }
 
-  // 2. If the function returned a single jsonb object under any single column
+  // Single JSONB object return
   if (
     rows.length === 1 &&
     keys.length === 1 &&
@@ -657,7 +958,7 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
     return rows[0][keys[0]];
   }
 
-  // 3. For functions defined as RETURNS TABLE(...), return the full array of row objects
+  // Table row arrays
   return rows;
 }
 
