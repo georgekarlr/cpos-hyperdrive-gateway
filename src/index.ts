@@ -983,14 +983,17 @@ function formatPostgrestResponse(rows: any[], functionName: string) {
 export default {
   fetch: app.fetch,
 
-  // Cloudflare runs this background hook automatically every 5 minutes
+  // Cloudflare runs this background hook automatically based on your wrangler.json schedule
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    console.log(`[EIS Cron Triggered]: Scheduled event fired at ${new Date().toISOString()}`);
+
     ctx.waitUntil((async () => {
       const sql = createDbClient(env.HYPERDRIVE.connectionString);
       try {
-        await sweepAndTransmitAllActiveEisMerchants(sql);
-      } catch (err) {
-        console.error('[Scheduled Cron EIS Background Sweep Error]:', err);
+        const result = await sweepAndTransmitAllActiveEisMerchants(sql);
+        console.log('[EIS Cron Sweep Result]:', JSON.stringify(result));
+      } catch (err: any) {
+        console.error('[Scheduled Cron EIS Background Sweep Error]:', err.message || err);
       } finally {
         await sql.end();
       }
