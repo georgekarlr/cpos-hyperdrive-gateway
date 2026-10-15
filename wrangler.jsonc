@@ -2,12 +2,18 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cpos-hyperdrive-gateway",
   "main": "src/index.ts",
-  "compatibility_date": "2026-10-04",
+  "compatibility_date": "2024-11-12",
   "compatibility_flags": ["nodejs_compat"],
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
       "id": "4d1fbf388ce747e18afcc98c39604127"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2_BUCKET",
+      "bucket_name": "ceintelly"
     }
   ],
   "vars": {
