@@ -27,7 +27,6 @@ export interface SweepResultSummary {
 /**
  * Sweeps all active EIS merchants across the database,
  * batches their pending sales, and transmits them to BIR EIS.
- * Runs automatically every 5 minutes via Cloudflare Scheduled Events.
  */
 export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<SweepResultSummary> {
   const summary: SweepResultSummary = {
@@ -40,7 +39,7 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
   };
 
   try {
-    // 1. Discover all stores with active EIS credentials AND pending invoices
+    // 1. Correctly join st_user_access for billing_type (VAT vs NON-VAT)
     const activeEisMerchants = await sql`
       SELECT DISTINCT 
         s.user_id, 
@@ -50,19 +49,20 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
         s.ptt_number, 
         s.environment,
         s.eis_mode,
-        b.business_name, 
-        b.tin, 
-        b.address, 
-        b.billing_type
+        COALESCE(b.business_name, 'My Business Name') AS business_name, 
+        COALESCE(b.tin, '000-000-000-00000') AS tin, 
+        COALESCE(b.address, 'Philippines') AS address, 
+        COALESCE(sua.billing_type, 'NON-VAT') AS billing_type
       FROM public.pos2_eis_settings s
       JOIN public.pos2_orders o ON s.user_id = o.user_id
       LEFT JOIN public.pos2_business_settings b ON s.user_id = b.user_id
+      LEFT JOIN public.st_user_access sua ON s.user_id = sua.user_id
       WHERE s.is_active = TRUE
         AND s.eis_mode != 'disabled'
         AND s.client_id IS NOT NULL 
         AND s.private_signing_key IS NOT NULL
         AND o.eis_status = 'pending'
-      LIMIT 20; -- Process up to 20 distinct stores per execution cycle
+      LIMIT 20;
     `;
 
     if (!activeEisMerchants || activeEisMerchants.length === 0) {
@@ -70,23 +70,19 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
       return summary;
     }
 
-    // 2. Iterate through each store independently (Error Isolated)
+    // 2. Process each store's pending batch
     for (const merchant of activeEisMerchants) {
       const storeName = merchant.business_name || `Store (${merchant.user_id})`;
 
       try {
-        // Fetch up to 100 oldest pending invoices for this store
         const pendingOrders = await sql`
           SELECT 
             o.*, 
             COALESCE(t.terminal_name, 'Register') AS terminal_name, 
             COALESCE(t.min, '01010-WEB') AS min, 
-            COALESCE(t.ptu_number, merchant_settings.ptt_number, 'PTU-000000') AS ptu_number
+            COALESCE(t.ptu_number, ${merchant.ptt_number}, 'PTU-000000') AS ptu_number
           FROM public.pos2_orders o
           LEFT JOIN public.pos2_terminals t ON o.terminal_id = t.id
-          LEFT JOIN (
-            SELECT user_id, ptt_number FROM public.pos2_eis_settings WHERE user_id = ${merchant.user_id}
-          ) merchant_settings ON o.user_id = merchant_settings.user_id
           WHERE o.user_id = ${merchant.user_id}
             AND o.eis_status = 'pending'
           ORDER BY COALESCE(o.occurred_at, o.created_at) ASC
@@ -99,7 +95,7 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
 
         const orderIds = pendingOrders.map((o: any) => o.id);
 
-        // Bulk-fetch all line items for this batch in 1 single query
+        // Bulk-fetch line items
         const allItems = await sql`
           SELECT 
             oi.*, 
@@ -110,7 +106,6 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
           WHERE oi.order_id = ANY(${orderIds});
         `;
 
-        // Group line items by order_id
         const itemsByOrder: Record<number, any[]> = {};
         for (const item of allItems) {
           if (!itemsByOrder[item.order_id]) {
@@ -119,7 +114,7 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
           itemsByOrder[item.order_id].push(item);
         }
 
-        // Format each invoice into BIR Schema v2.01 and digitally sign as JWS in parallel
+        // Format and sign JWS in parallel
         const signedJwsList: string[] = await Promise.all(
           pendingOrders.map(async (order: any) => {
             const orderItems = itemsByOrder[order.id] || [];
@@ -128,7 +123,6 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
           })
         );
 
-        // Setup credentials for this merchant
         const creds: EisCredentials = {
           clientId: merchant.client_id,
           clientSecret: merchant.client_secret,
@@ -137,17 +131,14 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
           environment: (merchant.environment || 'sandbox') as 'sandbox' | 'production',
         };
 
-        // Authenticate with BIR to get 6-hour Bearer token
         const authToken = await getBirAuthToken(creds);
-
-        // Transmit entire batch of up to 100 invoices in a single HTTPS call
         const batchResponse = await transmitBatchToBir(signedJwsList, authToken, creds);
+        
         const globalAckId = batchResponse.batchAckId 
           || batchResponse.ackId 
           || `BATCH-ACK-${Date.now()}`;
 
-        // 3. Update Order Records in Database
-        // If BIR returned per-invoice results, update each individually
+        // 3. Update orders
         if (Array.isArray(batchResponse.results) && batchResponse.results.length > 0) {
           for (const res of batchResponse.results) {
             const targetOrder = pendingOrders.find((o: any) => o.invoice_number === res.invoiceNumber);
@@ -165,7 +156,6 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
             }
           }
         } else {
-          // Bulk-update all orders in this batch to 'transmitted'
           await sql`
             UPDATE public.pos2_orders
             SET 
@@ -177,7 +167,6 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
           `;
         }
 
-        // Update last sync timestamp on merchant's EIS settings
         await sql`
           UPDATE public.pos2_eis_settings
           SET last_sync_at = NOW()
@@ -195,7 +184,7 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
 
       } catch (merchantErr: any) {
         const errorMsg = merchantErr.message || String(merchantErr);
-        console.error(`[EIS Auto-Sweep Failure for ${storeName}]:`, merchantErr);
+        console.error(`[EIS Auto-Sweep Failure for ${storeName}]:`, errorMsg);
 
         summary.errors.push({
           userId: merchant.user_id,
@@ -203,12 +192,10 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
           error: errorMsg,
         });
 
-        // Flag orders with the error details so accountants can review why transmission failed
         try {
           await sql`
             UPDATE public.pos2_orders
-            SET 
-              eis_error_log = ${errorMsg}
+            SET eis_error_log = ${errorMsg}
             WHERE user_id = ${merchant.user_id} 
               AND eis_status = 'pending';
           `;
@@ -218,9 +205,10 @@ export async function sweepAndTransmitAllActiveEisMerchants(sql: any): Promise<S
 
     return summary;
   } catch (criticalErr: any) {
-    console.error('[EIS Critical Sweep Crash]:', criticalErr);
+    const errorDetails = criticalErr.message || String(criticalErr);
+    console.error('[EIS Critical Sweep Crash]:', errorDetails);
     summary.success = false;
-    summary.message = criticalErr.message || 'Fatal error during EIS sweep.';
+    summary.message = errorDetails;
     return summary;
   }
 }
