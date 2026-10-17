@@ -602,6 +602,8 @@ const PUBLIC_ANON_FUNCTIONS = new Set([
   'can_submit_new_password',
   'c_verify_password_reset_rate_limit',
   'c_get_marketplace_products',
+  'pos2_get_public_kiosk_menu',                 // <-- Public Menu by QR Token
+  'pos2_submit_unauthenticated_order_slip',
 ]);
 
 const EXTRA_AUTH_FUNCTIONS = new Set([
